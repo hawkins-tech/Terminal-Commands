@@ -33,6 +33,7 @@ killgrep [-s SIGNAL] [-I] [-x] [-n] [-u USER] pattern
 **Options:**
 - `-s SIGNAL` - Signal to send (default: TERM). Examples: HUP, INT, TERM, KILL, 9
 - `-I` - Case-sensitive match (default is case-insensitive)
+- `-C` - Alias for `-I` (case-sensitive match)
 - `-x` - Exact match (treat pattern as a literal name)
 - `-n` - Dry run (print matches without sending signals)
 - `-u USER` - Only match processes owned by USER
