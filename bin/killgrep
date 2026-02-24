@@ -2,141 +2,151 @@
 # killgrep: kill processes by regex match on the process name (/proc/<pid>/comm)
 # Default matching is case-insensitive.
 
-set -o pipefail
+set -euo pipefail
 
 usage() {
   cat <<EOF
 Usage: $(basename "$0") [-s SIGNAL] [-I] [-x] [-n] [-u USER] pattern
-  pattern       ERE applied to process name (comm), not full command line
+  pattern       ERE applied to full ps command line (like grep)
 Options:
   -s SIGNAL     Signal to send (default: TERM). Examples: HUP, INT, TERM, KILL, 9
-  -I            Case-sensitive match. By default matching is case-insensitive
-  -x            Exact match (treat pattern as a literal name)
-  -n            Dry run. Print matches without sending signals
-  -u USER       Only match processes owned by USER
+  -I            Case-sensitive match. Default is case-insensitive (like grep -i)
+  -x            Exact match (treat pattern as a literal string; must match entire command line)
+  -n            Dry run. Print matched PIDs/lines without sending signals
+  -u USER       Only match processes owned by USER (like ps ... -u USER)
   -h            Show this help
 EOF
 }
 
 signal="TERM"
-insensitive=1   # default: case-insensitive
+insensitive=1
 exact=0
 dry_run=0
 user_filter=""
 
-while getopts "s:Ixnu:Ch" opt; do
+while getopts "s:Ixnu:h" opt; do
   case "$opt" in
     s) signal="$OPTARG" ;;
-    I) insensitive=0 ;;     # force case-sensitive
+    I) insensitive=0 ;;
     x) exact=1 ;;
     n) dry_run=1 ;;
     u) user_filter="$OPTARG" ;;
-    C) insensitive=0 ;;     # alias for -I
     h) usage; exit 0 ;;
     *) usage; exit 1 ;;
   esac
 done
 shift $((OPTIND - 1))
 
-if [ $# -lt 1 ]; then
+if [[ $# -lt 1 ]]; then
   usage
   exit 1
 fi
 
 pattern="$1"
+self_pid="$$"
 
-if [ "$exact" -eq 1 ]; then
-  # Escape regex meta for literal exact match on name
-  pattern="$(printf '%s' "$pattern" | sed -E 's/[][(){}.^$|*+?\\]/\\&/g')"
-  pattern="^${pattern}$"
+# Build a safe regex. Default uses ERE, -x turns into literal full-line match.
+if [[ "$exact" -eq 1 ]]; then
+  # Escape ERE metachars, then anchor whole line.
+  esc="$(printf '%s' "$pattern" | sed -E 's/[][(){}.^$|*+?\\]/\\&/g')"
+  pattern="^${esc}$"
 fi
 
-self_pid=$$
-parent_pid=$PPID
+# Build ps command. Use "ps aux" to mimic your pipeline.
+# We'll parse: USER PID ... COMMAND (rest of line)
+ps_cmd=(ps aux)
+if [[ -n "$user_filter" ]]; then
+  # Most ps implementations accept `ps -u user -o ...`, but to stay close to aux output:
+  # filter by USER column via awk below, not ps flags, so output format stays "aux".
+  :
+fi
 
-declare -a kill_pids
-declare -A name_by_pid
+# Collect matching PIDs, excluding:
+# - the grep itself (like grep -v grep)
+# - this script PID (avoid self)
+# - the parent shell is NOT excluded here (ps|grep wouldn't exclude it unless it matches)
+matches="$(
+  "${ps_cmd[@]}" \
+  | awk -v self="$self_pid" '
+      NR==1 { next }     # skip header
+      {
+        user=$1; pid=$2;
+        # rebuild "command line" like grep sees it: everything from $11 to end (ps aux layout)
+        cmd="";
+        for (i=11; i<=NF; i++) cmd = cmd (i==11 ? "" : OFS) $i;
+        print user "\t" pid "\t" cmd;
+      }
+    ' \
+  | {
+      if [[ -n "$user_filter" ]]; then
+        awk -F'\t' -v u="$user_filter" '$1==u'
+      else
+        cat
+      fi
+    } \
+  | {
+      if [[ "$insensitive" -eq 1 ]]; then
+        grep -Ei -- "$pattern" || true
+      else
+        grep -E -- "$pattern" || true
+      fi
+    } \
+  | grep -Fv -- $'\tgrep ' || true
+)"
 
-for d in /proc/[0-9]*; do
-  pid="${d#/proc/}"
-
-  # skip pid 1, self, and parent shell
-  if [[ "$pid" -eq 1 || "$pid" -eq "$self_pid" || "$pid" -eq "$parent_pid" ]]; then
-    continue
-  fi
-
-  # read process name
-  if ! read -r comm < "$d/comm" 2>/dev/null; then
-    continue
-  fi
-
-  # skip kernel-style bracketed threads
-  [[ "$comm" == \[*\] ]] && continue
-
-  # user filter if requested
-  if [[ -n "$user_filter" ]]; then
-    proc_user="$(stat -c %U "$d" 2>/dev/null || echo "")"
-    [[ -z "$proc_user" || "$proc_user" != "$user_filter" ]] && continue
-  fi
-
-  # match against process name only
-  if [ "$insensitive" -eq 1 ]; then
-    if printf '%s\n' "$comm" | grep -Eqi -- "$pattern"; then
-      kill_pids+=("$pid")
-      name_by_pid["$pid"]="$comm"
-    fi
-  else
-    if printf '%s\n' "$comm" | grep -Eq -- "$pattern"; then
-      kill_pids+=("$pid")
-      name_by_pid["$pid"]="$comm"
-    fi
-  fi
-done
-
-if [ "${#kill_pids[@]}" -eq 0 ]; then
-  echo "killgrep: no processes matched pattern on process name: $pattern" >&2
+if [[ -z "${matches//$'\n'/}" ]]; then
+  echo "killgrep2: no processes matched pattern on ps command line: $1" >&2
   exit 1
 fi
 
-if [ "$dry_run" -eq 1 ]; then
-  echo "Would send SIG${signal} to the following PIDs (name):"
-  for pid in "${kill_pids[@]}"; do
-    echo "  $pid (${name_by_pid[$pid]})"
-  done
+# Extract PIDs (like awk '{print $2}') and de-dupe.
+mapfile -t pids < <(printf '%s\n' "$matches" | awk -F'\t' '{print $2}' | awk '!seen[$0]++')
+
+if [[ "${#pids[@]}" -eq 0 ]]; then
+  echo "killgrep2: matched lines but no PIDs extracted (unexpected)." >&2
+  exit 1
+fi
+
+if [[ "$dry_run" -eq 1 ]]; then
+  echo "Would send SIG${signal} to:"
+  printf '%s\n' "$matches" | awk -F'\t' '{printf "  %s (%s)\n", $2, $3}'
   exit 0
 fi
 
-send_batch() {
+# Like xargs kill: kill in one go if possible, else fall back.
+kill_one() {
+  local pid="$1"
   if [[ "$signal" =~ ^[0-9]+$ ]]; then
-    kill -"${signal}" -- "${kill_pids[@]}" 2>/dev/null
+    kill -"${signal}" -- "$pid"
   else
-    kill -s "$signal" -- "${kill_pids[@]}" 2>/dev/null
+    kill -s "$signal" -- "$pid"
   fi
 }
 
-if send_batch; then
-  for pid in "${kill_pids[@]}"; do
-    echo "Sent SIG${signal} to $pid (${name_by_pid[$pid]})"
-  done
+kill_batch() {
+  if [[ "$signal" =~ ^[0-9]+$ ]]; then
+    kill -"${signal}" -- "${pids[@]}"
+  else
+    kill -s "$signal" -- "${pids[@]}"
+  fi
+}
+
+rc=0
+if kill_batch 2>/dev/null; then
+  while IFS=$'\t' read -r _user pid cmd; do
+    echo "Sent SIG${signal} to $pid ($cmd)"
+  done <<<"$matches"
   exit 0
 fi
 
-rc=0
-for pid in "${kill_pids[@]}"; do
-  if [[ "$signal" =~ ^[0-9]+$ ]]; then
-    if kill -"${signal}" -- "$pid" 2>/dev/null; then
-      echo "Sent SIG${signal} to $pid (${name_by_pid[$pid]})"
-    else
-      echo "Failed to signal $pid (${name_by_pid[$pid]})" >&2
-      rc=1
-    fi
+for pid in "${pids[@]}"; do
+  if kill_one "$pid" 2>/dev/null; then
+    cmd="$(printf '%s\n' "$matches" | awk -F'\t' -v p="$pid" '$2==p {print $3; exit}')"
+    echo "Sent SIG${signal} to $pid (${cmd:-unknown})"
   else
-    if kill -s "$signal" -- "$pid" 2>/dev/null; then
-      echo "Sent SIG${signal} to $pid (${name_by_pid[$pid]})"
-    else
-      echo "Failed to signal $pid (${name_by_pid[$pid]})" >&2
-      rc=1
-    fi
+    cmd="$(printf '%s\n' "$matches" | awk -F'\t' -v p="$pid" '$2==p {print $3; exit}')"
+    echo "Failed to signal $pid (${cmd:-unknown})" >&2
+    rc=1
   fi
 done
-exit $rc
+exit "$rc"
