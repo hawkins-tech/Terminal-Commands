@@ -48,6 +48,43 @@ killgrep -x bash           # Exact match: only kill processes named exactly "bas
 killgrep -u www-data nginx # Kill nginx processes owned by www-data
 ```
 
+### firstmatch
+
+Read piped input, print the first matching line, then exit immediately.
+
+Useful for waiting on streaming output until a specific line appears, then stopping the pipeline.
+
+**Usage:**
+```bash
+firstmatch [options] pattern
+````
+
+**Options:**
+
+* `-i, --ignore-case` - Case-insensitive matching
+* `-F, --fixed-string` - Treat pattern as a literal string instead of regex
+* `-v, --invert-match` - Match the first line that does not match the pattern
+* `-n, --line-number` - Prefix output with the 1-based line number
+* `-q, --quiet` - Do not print the line, just exit successfully on first match
+* `-h, --help` - Show help
+
+**Examples:**
+
+```bash
+tail -f app.log | firstmatch "server started"
+journalctl -f -u nginx | firstmatch -i "ready"
+some_command | firstmatch -F "exact text"
+some_command | firstmatch -n "connected"
+some_command | firstmatch -q "success"
+some_command | firstmatch -v "^DEBUG"
+```
+
+**Exit codes:**
+
+* `0` - A matching line was found
+* `1` - No matching line was found before input ended
+* `130` - Interrupted with `Ctrl+C`
+
 ### always
 
 Keep running a command repeatedly until interrupted.
