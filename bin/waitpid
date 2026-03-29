@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# waitpid - Wait for any process to exit (not just children)
+
+set -e
+
+usage() {
+  cat <<'EOF'
+Usage: waitpid [options] PID | -p PATTERN
+
+Wait for a process to exit. Works with any process, not just children
+of the current shell.
+
+Options:
+  -p, --pattern PAT    Wait for process matching name pattern to exit
+  -t, --timeout SECS   Maximum seconds to wait (default: 0 = forever)
+  -i, --interval SECS  Seconds between checks (default: 1)
+  -q, --quiet          Suppress progress output
+  -h, --help           Show this help
+
+Examples:
+  waitpid 1234                     # Wait for PID 1234 to exit
+  waitpid -p "webpack" -t 60      # Wait up to 60s for webpack to exit
+  waitpid -p "npm test" -q        # Quietly wait for npm test to finish
+
+Exit codes:
+  0  Process has exited
+  1  Timeout reached or process not found
+EOF
+  exit 0
+}
+
+PID=""
+PATTERN=""
+TIMEOUT=0
+INTERVAL=1
+QUIET=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -p|--pattern)  PATTERN="$2"; shift 2 ;;
+    -t|--timeout)  TIMEOUT="$2"; shift 2 ;;
+    -i|--interval) INTERVAL="$2"; shift 2 ;;
+    -q|--quiet)    QUIET=true; shift ;;
+    -h|--help)     usage ;;
+    -*)            echo "Unknown option: $1" >&2; exit 1 ;;
+    *)             PID="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$PID" && -z "$PATTERN" ]]; then
+  echo "Error: PID or --pattern is required" >&2
+  exit 1
+fi
+
+# Resolve pattern to PID
+if [[ -n "$PATTERN" ]]; then
+  PID=$(pgrep -f "$PATTERN" | head -1)
+  if [[ -z "$PID" ]]; then
+    [[ "$QUIET" == false ]] && echo "No process found matching: $PATTERN" >&2
+    exit 1
+  fi
+  [[ "$QUIET" == false ]] && echo "Waiting for PID $PID ($(ps -o comm= -p "$PID" 2>/dev/null || echo 'unknown'))..." >&2
+fi
+
+if ! kill -0 "$PID" 2>/dev/null; then
+  [[ "$QUIET" == false ]] && echo "Process $PID is not running" >&2
+  exit 0
+fi
+
+elapsed=0
+while kill -0 "$PID" 2>/dev/null; do
+  if [[ "$TIMEOUT" -gt 0 && "$elapsed" -ge "$TIMEOUT" ]]; then
+    [[ "$QUIET" == false ]] && echo "Timeout: process $PID still running after ${TIMEOUT}s" >&2
+    exit 1
+  fi
+
+  sleep "$INTERVAL"
+  elapsed=$((elapsed + INTERVAL))
+done
+
+[[ "$QUIET" == false ]] && echo "Process $PID exited (waited ${elapsed}s)" >&2
+exit 0

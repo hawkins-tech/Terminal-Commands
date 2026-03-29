@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""trash - Move files to XDG trash instead of permanent deletion."""
+
+import os
+import sys
+import shutil
+import time
+import urllib.parse
+from pathlib import Path
+from datetime import datetime
+
+TRASH_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "Trash"
+TRASH_FILES = TRASH_DIR / "files"
+TRASH_INFO = TRASH_DIR / "info"
+
+
+def ensure_trash_dirs():
+    TRASH_FILES.mkdir(parents=True, exist_ok=True)
+    TRASH_INFO.mkdir(parents=True, exist_ok=True)
+
+
+def unique_name(name):
+    """Generate a unique name if a file with this name is already in trash."""
+    if not (TRASH_FILES / name).exists():
+        return name
+    base, ext = os.path.splitext(name)
+    counter = 1
+    while (TRASH_FILES / f"{base}.{counter}{ext}").exists():
+        counter += 1
+    return f"{base}.{counter}{ext}"
+
+
+def cmd_put(paths):
+    """Move files/directories to trash."""
+    if not paths:
+        print("Usage: trash PATH [PATH...]", file=sys.stderr)
+        sys.exit(1)
+
+    ensure_trash_dirs()
+
+    for path_str in paths:
+        path = Path(path_str).resolve()
+        if not path.exists() and not path.is_symlink():
+            print(f"Warning: '{path_str}' not found, skipping", file=sys.stderr)
+            continue
+
+        name = unique_name(path.name)
+        deletion_date = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+        # Write .trashinfo file (XDG Trash spec)
+        info_content = (
+            "[Trash Info]\n"
+            f"Path={urllib.parse.quote(str(path), safe='/:@')}\n"
+            f"DeletionDate={deletion_date}\n"
+        )
+        info_path = TRASH_INFO / f"{name}.trashinfo"
+        info_path.write_text(info_content)
+
+        # Move to trash
+        dest = TRASH_FILES / name
+        try:
+            shutil.move(str(path), str(dest))
+            print(f"Trashed: {path_str}", file=sys.stderr)
+        except Exception as e:
+            info_path.unlink(missing_ok=True)
+            print(f"Error trashing '{path_str}': {e}", file=sys.stderr)
+
+
+def cmd_list():
+    """List items in trash."""
+    ensure_trash_dirs()
+
+    items = sorted(TRASH_INFO.glob("*.trashinfo"))
+    if not items:
+        print("Trash is empty", file=sys.stderr)
+        return
+
+    for info_path in items:
+        name = info_path.stem
+        original = ""
+        date = ""
+        for line in info_path.read_text().splitlines():
+            if line.startswith("Path="):
+                original = urllib.parse.unquote(line[5:])
+            elif line.startswith("DeletionDate="):
+                date = line[13:]
+
+        trash_path = TRASH_FILES / name
+        if trash_path.is_dir():
+            kind = "dir "
+            size = sum(f.stat().st_size for f in trash_path.rglob("*") if f.is_file())
+        elif trash_path.exists():
+            kind = "file"
+            size = trash_path.stat().st_size
+        else:
+            kind = "gone"
+            size = 0
+
+        size_str = format_size(size)
+        print(f"  {kind}  {size_str:>8}  {date}  {name}")
+        if original and original != name:
+            print(f"         from: {original}")
+
+
+def cmd_restore(names):
+    """Restore items from trash to original location."""
+    if not names:
+        print("Usage: trash restore NAME [NAME...]", file=sys.stderr)
+        sys.exit(1)
+
+    ensure_trash_dirs()
+
+    for name in names:
+        info_path = TRASH_INFO / f"{name}.trashinfo"
+        trash_path = TRASH_FILES / name
+
+        if not info_path.exists():
+            print(f"Not in trash: {name}", file=sys.stderr)
+            continue
+
+        original = ""
+        for line in info_path.read_text().splitlines():
+            if line.startswith("Path="):
+                original = urllib.parse.unquote(line[5:])
+
+        if not original:
+            print(f"Cannot determine original path for: {name}", file=sys.stderr)
+            continue
+
+        dest = Path(original)
+        if dest.exists():
+            print(f"Destination exists, cannot restore: {dest}", file=sys.stderr)
+            continue
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.move(str(trash_path), str(dest))
+            info_path.unlink()
+            print(f"Restored: {dest}", file=sys.stderr)
+        except Exception as e:
+            print(f"Error restoring '{name}': {e}", file=sys.stderr)
+
+
+def cmd_empty(force=False):
+    """Permanently delete all items in trash."""
+    ensure_trash_dirs()
+
+    items = list(TRASH_FILES.iterdir())
+    if not items:
+        print("Trash is already empty", file=sys.stderr)
+        return
+
+    if not force:
+        print(f"Permanently delete {len(items)} items from trash? [y/N] ", end="", file=sys.stderr)
+        try:
+            answer = input().strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in ("y", "yes"):
+            print("Cancelled", file=sys.stderr)
+            return
+
+    count = 0
+    for item in items:
+        try:
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+            # Remove matching .trashinfo
+            info = TRASH_INFO / f"{item.name}.trashinfo"
+            info.unlink(missing_ok=True)
+            count += 1
+        except Exception as e:
+            print(f"Error deleting '{item.name}': {e}", file=sys.stderr)
+
+    print(f"Permanently deleted {count} items", file=sys.stderr)
+
+
+def format_size(size):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024:
+            return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}PB"
+
+
+def usage():
+    print("""Usage: trash <command> [args...]
+
+Move files to recoverable XDG trash instead of permanent deletion.
+
+Commands:
+  PATH [PATH...]           Move files/directories to trash
+  list                     List items in trash
+  restore NAME [NAME...]   Restore items to original location
+  empty [-f]               Permanently delete all trash (-f skips confirmation)
+
+Examples:
+  trash file.txt dir/           # Move to trash
+  trash list                    # See what's in trash
+  trash restore file.txt        # Restore to original location
+  trash empty                   # Permanently delete all trash""")
+    sys.exit(0)
+
+
+def main():
+    args = sys.argv[1:]
+
+    if not args or "-h" in args or "--help" in args:
+        usage()
+
+    cmd = args[0]
+
+    if cmd == "list":
+        cmd_list()
+    elif cmd == "restore":
+        cmd_restore(args[1:])
+    elif cmd == "empty":
+        cmd_empty(force="-f" in args)
+    else:
+        # Default: treat all args as paths to trash
+        cmd_put(args)
+
+
+if __name__ == "__main__":
+    main()

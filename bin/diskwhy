@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""diskwhy - Show what's using disk space, sorted by size, as JSON."""
+
+import json
+import os
+import sys
+import subprocess
+
+
+def format_size(size_bytes):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(size_bytes) < 1024:
+            return f"{size_bytes:.1f}{unit}" if unit != "B" else f"{size_bytes:.0f}B"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f}PB"
+
+
+def get_sizes(path, depth=1):
+    """Use du to get sizes at the given depth."""
+    try:
+        result = subprocess.run(
+            ["du", "-b", f"--max-depth={depth}", "--", path],
+            capture_output=True, text=True, timeout=30
+        )
+        entries = []
+        for line in result.stdout.strip().split("\n"):
+            if not line:
+                continue
+            parts = line.split("\t", 1)
+            if len(parts) == 2:
+                size = int(parts[0])
+                entry_path = parts[1]
+                entries.append((size, entry_path))
+        return entries
+    except Exception as e:
+        print(f"Error scanning {path}: {e}", file=sys.stderr)
+        return []
+
+
+def scan_files(path, top_n=20):
+    """Walk directory and find the largest individual files."""
+    files = []
+    try:
+        for root, dirs, filenames in os.walk(path):
+            for f in filenames:
+                fp = os.path.join(root, f)
+                try:
+                    size = os.lstat(fp).st_size
+                    files.append((size, fp))
+                except (OSError, IOError):
+                    pass
+    except (OSError, IOError):
+        pass
+    files.sort(reverse=True)
+    return files[:top_n]
+
+
+def main():
+    pretty = "--pretty" in sys.argv or "-p" in sys.argv
+    json_mode = "--json" in sys.argv or "-j" in sys.argv
+
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+
+    if "-h" in sys.argv or "--help" in sys.argv:
+        print("""Usage: diskwhy [options] [PATH]
+
+Show what's using disk space under PATH (default: current directory).
+
+Options:
+  -n, --top N      Show top N entries (default: 20)
+  -f, --files      Also show largest individual files
+  -d, --depth N    Directory depth for du scan (default: 1)
+  -p, --pretty     Pretty-print JSON output
+  -j, --json       Force JSON output (default is human-readable)
+  -h, --help       Show this help
+
+Examples:
+  diskwhy                    # Current directory, human-readable
+  diskwhy /var -n 10         # Top 10 entries under /var
+  diskwhy -f /home           # Include largest individual files
+  diskwhy --json --pretty    # JSON output, pretty-printed""")
+        sys.exit(0)
+
+    top_n = 20
+    depth = 1
+    show_files = False
+    positional = []
+
+    i = 1
+    while i < len(sys.argv):
+        a = sys.argv[i]
+        if a in ("-n", "--top") and i + 1 < len(sys.argv):
+            top_n = int(sys.argv[i + 1])
+            i += 2
+            continue
+        elif a in ("-d", "--depth") and i + 1 < len(sys.argv):
+            depth = int(sys.argv[i + 1])
+            i += 2
+            continue
+        elif a in ("-f", "--files"):
+            show_files = True
+        elif a in ("-p", "--pretty"):
+            pass  # handled above
+        elif a in ("-j", "--json"):
+            pass  # handled above
+        elif a in ("-h", "--help"):
+            pass  # handled above
+        elif not a.startswith("-"):
+            positional.append(a)
+        i += 1
+
+    path = positional[0] if positional else "."
+    path = os.path.abspath(path)
+
+    if not os.path.exists(path):
+        print(f"Error: path '{path}' does not exist", file=sys.stderr)
+        sys.exit(1)
+
+    entries = get_sizes(path, depth)
+    # Remove the root entry itself, sort descending
+    entries = [(s, p) for s, p in entries if os.path.abspath(p) != os.path.abspath(path)]
+    entries.sort(reverse=True)
+    entries = entries[:top_n]
+
+    result = {
+        "path": path,
+        "directories": [
+            {"path": p, "size_bytes": s, "size_human": format_size(s)}
+            for s, p in entries
+        ],
+    }
+
+    if show_files:
+        largest_files = scan_files(path, top_n)
+        result["largest_files"] = [
+            {"path": p, "size_bytes": s, "size_human": format_size(s)}
+            for s, p in largest_files
+        ]
+
+    # Total size of scanned path
+    try:
+        du_result = subprocess.run(
+            ["du", "-sb", "--", path],
+            capture_output=True, text=True, timeout=10
+        )
+        total = int(du_result.stdout.split("\t")[0])
+        result["total_bytes"] = total
+        result["total_human"] = format_size(total)
+    except Exception:
+        pass
+
+    if json_mode:
+        indent = 2 if pretty else None
+        print(json.dumps(result, indent=indent))
+    else:
+        # Human-readable output
+        print(f"\nDisk usage: {path}")
+        if "total_human" in result:
+            print(f"Total: {result['total_human']}")
+        print()
+
+        if entries:
+            max_size_len = max(len(format_size(s)) for s, _ in entries)
+            for size, epath in entries:
+                rel = os.path.relpath(epath, path)
+                print(f"  {format_size(size):>{max_size_len}}  {rel}")
+
+        if show_files and "largest_files" in result and result["largest_files"]:
+            print(f"\nLargest files:")
+            max_size_len = max(len(f["size_human"]) for f in result["largest_files"])
+            for f in result["largest_files"]:
+                rel = os.path.relpath(f["path"], path)
+                print(f"  {f['size_human']:>{max_size_len}}  {rel}")
+
+
+if __name__ == "__main__":
+    main()

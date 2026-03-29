@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# checkpoint - Named file/directory snapshots for easy undo
+
+set -e
+
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-$HOME/.local/share/checkpoints}"
+
+usage() {
+  cat <<'EOF'
+Usage: checkpoint <command> [options]
+
+Create named snapshots of files/directories for easy undo.
+Snapshots are stored in ~/.local/share/checkpoints/.
+
+Commands:
+  save NAME PATH [PATH...]    Save a named snapshot of files/directories
+  restore NAME [DEST]         Restore a snapshot (DEST defaults to original location)
+  list                        List all saved checkpoints
+  show NAME                   Show contents of a checkpoint
+  delete NAME                 Delete a checkpoint
+  diff NAME [PATH]            Diff a checkpoint against current state
+
+Options:
+  -h, --help    Show this help
+
+Examples:
+  checkpoint save before-refactor ./src
+  checkpoint save myconfig ~/.bashrc ~/.profile
+  checkpoint restore before-refactor
+  checkpoint diff before-refactor ./src
+  checkpoint list
+  checkpoint delete before-refactor
+EOF
+  exit 0
+}
+
+cmd_save() {
+  local name="$1"; shift
+  if [[ -z "$name" || $# -eq 0 ]]; then
+    echo "Usage: checkpoint save NAME PATH [PATH...]" >&2
+    exit 1
+  fi
+
+  local snap_dir="$CHECKPOINT_DIR/$name"
+  if [[ -d "$snap_dir" ]]; then
+    echo "Checkpoint '$name' already exists. Delete it first or use a different name." >&2
+    exit 1
+  fi
+
+  mkdir -p "$snap_dir/data"
+
+  # Store metadata
+  local meta="$snap_dir/meta"
+  echo "created=$(date -Iseconds)" > "$meta"
+  echo "cwd=$(pwd)" >> "$meta"
+  echo "paths=" >> "$meta"
+
+  local count=0
+  for path in "$@"; do
+    local abs_path
+    abs_path=$(realpath "$path" 2>/dev/null || echo "$path")
+
+    # Store original path mapping
+    echo "$abs_path" >> "$snap_dir/paths.txt"
+
+    if [[ -d "$path" ]]; then
+      local dest="$snap_dir/data/$count"
+      cp -a "$path" "$dest"
+    elif [[ -f "$path" ]]; then
+      mkdir -p "$snap_dir/data/$count"
+      cp -a "$path" "$snap_dir/data/$count/$(basename "$path")"
+    else
+      echo "Warning: skipping '$path' (not found)" >&2
+      echo "" >> "$snap_dir/paths.txt"  # placeholder
+      count=$((count + 1))
+      continue
+    fi
+    count=$((count + 1))
+  done
+
+  echo "Checkpoint '$name' saved ($count items)" >&2
+}
+
+cmd_restore() {
+  local name="$1"
+  local dest="$2"
+
+  if [[ -z "$name" ]]; then
+    echo "Usage: checkpoint restore NAME [DEST]" >&2
+    exit 1
+  fi
+
+  local snap_dir="$CHECKPOINT_DIR/$name"
+  if [[ ! -d "$snap_dir" ]]; then
+    echo "Checkpoint '$name' not found" >&2
+    exit 1
+  fi
+
+  local idx=0
+  while IFS= read -r orig_path; do
+    local src="$snap_dir/data/$idx"
+    if [[ ! -e "$src" ]]; then
+      idx=$((idx + 1))
+      continue
+    fi
+
+    local target
+    if [[ -n "$dest" ]]; then
+      target="$dest"
+    else
+      target="$orig_path"
+    fi
+
+    if [[ -d "$src" ]]; then
+      # Check if the source dir contains a single file (was a file checkpoint)
+      local file_count
+      file_count=$(find "$src" -maxdepth 1 -not -name "$(basename "$src")" | wc -l | tr -d ' ')
+      if [[ "$file_count" -eq 1 && -f "$src/"* 2>/dev/null ]]; then
+        # It was a single file
+        local fname
+        fname=$(ls "$src")
+        cp -a "$src/$fname" "$target"
+      else
+        # It was a directory
+        if [[ -d "$target" ]]; then
+          rm -rf "$target"
+        fi
+        cp -a "$src" "$target"
+      fi
+    fi
+
+    echo "Restored: $target" >&2
+    idx=$((idx + 1))
+  done < "$snap_dir/paths.txt"
+
+  echo "Checkpoint '$name' restored" >&2
+}
+
+cmd_list() {
+  if [[ ! -d "$CHECKPOINT_DIR" ]]; then
+    echo "No checkpoints found" >&2
+    exit 0
+  fi
+
+  for snap_dir in "$CHECKPOINT_DIR"/*/; do
+    [[ -d "$snap_dir" ]] || continue
+    local name
+    name=$(basename "$snap_dir")
+    local created=""
+    if [[ -f "$snap_dir/meta" ]]; then
+      created=$(grep '^created=' "$snap_dir/meta" | cut -d= -f2-)
+    fi
+    local item_count
+    item_count=$(wc -l < "$snap_dir/paths.txt" 2>/dev/null | tr -d ' ' || echo 0)
+    local size
+    size=$(du -sh "$snap_dir/data" 2>/dev/null | cut -f1 || echo "?")
+
+    printf "%-20s %s  (%s items, %s)\n" "$name" "$created" "$item_count" "$size"
+  done
+}
+
+cmd_show() {
+  local name="$1"
+  if [[ -z "$name" ]]; then
+    echo "Usage: checkpoint show NAME" >&2
+    exit 1
+  fi
+
+  local snap_dir="$CHECKPOINT_DIR/$name"
+  if [[ ! -d "$snap_dir" ]]; then
+    echo "Checkpoint '$name' not found" >&2
+    exit 1
+  fi
+
+  echo "Checkpoint: $name"
+  if [[ -f "$snap_dir/meta" ]]; then
+    cat "$snap_dir/meta"
+  fi
+  echo "---"
+  echo "Saved paths:"
+  cat "$snap_dir/paths.txt"
+  echo "---"
+  echo "Contents:"
+  find "$snap_dir/data" -type f | head -50
+}
+
+cmd_delete() {
+  local name="$1"
+  if [[ -z "$name" ]]; then
+    echo "Usage: checkpoint delete NAME" >&2
+    exit 1
+  fi
+
+  local snap_dir="$CHECKPOINT_DIR/$name"
+  if [[ ! -d "$snap_dir" ]]; then
+    echo "Checkpoint '$name' not found" >&2
+    exit 1
+  fi
+
+  rm -rf "$snap_dir"
+  echo "Checkpoint '$name' deleted" >&2
+}
+
+cmd_diff() {
+  local name="$1"
+  local target="$2"
+
+  if [[ -z "$name" ]]; then
+    echo "Usage: checkpoint diff NAME [PATH]" >&2
+    exit 1
+  fi
+
+  local snap_dir="$CHECKPOINT_DIR/$name"
+  if [[ ! -d "$snap_dir" ]]; then
+    echo "Checkpoint '$name' not found" >&2
+    exit 1
+  fi
+
+  local idx=0
+  while IFS= read -r orig_path; do
+    local src="$snap_dir/data/$idx"
+    local cmp="${target:-$orig_path}"
+
+    if [[ -d "$src" && -d "$cmp" ]]; then
+      diff -rq "$src" "$cmp" 2>/dev/null || true
+    elif [[ -f "$src/"* && -f "$cmp" ]]; then
+      diff "$src/"* "$cmp" 2>/dev/null || true
+    fi
+    idx=$((idx + 1))
+  done < "$snap_dir/paths.txt"
+}
+
+# Main dispatch
+case "${1:-}" in
+  save)    shift; cmd_save "$@" ;;
+  restore) shift; cmd_restore "$@" ;;
+  list)    cmd_list ;;
+  show)    shift; cmd_show "$@" ;;
+  delete)  shift; cmd_delete "$@" ;;
+  diff)    shift; cmd_diff "$@" ;;
+  -h|--help|"") usage ;;
+  *)       echo "Unknown command: $1" >&2; exit 1 ;;
+esac

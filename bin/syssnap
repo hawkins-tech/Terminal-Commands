@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""syssnap - JSON snapshot of system health: CPU, memory, disk, load, top processes."""
+
+import json
+import os
+import sys
+import subprocess
+
+def read_file(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except (OSError, IOError):
+        return None
+
+def get_cpu_usage():
+    """Read /proc/stat twice with a small gap to compute CPU percentage."""
+    def read_stat():
+        line = read_file("/proc/stat")
+        if not line:
+            return None
+        parts = line.split("\n")[0].split()
+        # user nice system idle iowait irq softirq steal
+        vals = [int(x) for x in parts[1:9]]
+        idle = vals[3] + vals[4]
+        total = sum(vals)
+        return total, idle
+
+    s1 = read_stat()
+    if not s1:
+        return None
+
+    import time
+    time.sleep(0.25)
+
+    s2 = read_stat()
+    if not s2:
+        return None
+
+    total_d = s2[0] - s1[0]
+    idle_d = s2[1] - s1[1]
+    if total_d == 0:
+        return 0.0
+    return round((1.0 - idle_d / total_d) * 100, 1)
+
+def get_memory():
+    text = read_file("/proc/meminfo")
+    if not text:
+        return None
+
+    info = {}
+    for line in text.split("\n"):
+        if ":" in line:
+            key, val = line.split(":", 1)
+            # Value in kB
+            parts = val.strip().split()
+            info[key.strip()] = int(parts[0]) * 1024  # convert to bytes
+
+    total = info.get("MemTotal", 0)
+    available = info.get("MemAvailable", 0)
+    used = total - available
+    swap_total = info.get("SwapTotal", 0)
+    swap_free = info.get("SwapFree", 0)
+    swap_used = swap_total - swap_free
+
+    def to_gb(b):
+        return round(b / (1024**3), 2)
+
+    return {
+        "total_gb": to_gb(total),
+        "used_gb": to_gb(used),
+        "available_gb": to_gb(available),
+        "percent": round(used / total * 100, 1) if total else 0,
+        "swap_total_gb": to_gb(swap_total),
+        "swap_used_gb": to_gb(swap_used),
+    }
+
+def get_disk():
+    disks = []
+    try:
+        result = subprocess.run(
+            ["df", "-B1", "--output=target,size,used,avail,pcent,fstype"],
+            capture_output=True, text=True, timeout=5
+        )
+        lines = result.stdout.strip().split("\n")[1:]  # skip header
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 6 and not parts[0].startswith("/snap"):
+                mount = parts[0]
+                # Skip pseudo filesystems
+                if parts[5] in ("tmpfs", "devtmpfs", "squashfs", "overlay", "efivarfs"):
+                    continue
+                def to_gb(b):
+                    return round(int(b) / (1024**3), 2)
+                disks.append({
+                    "mount": mount,
+                    "fstype": parts[5],
+                    "total_gb": to_gb(parts[1]),
+                    "used_gb": to_gb(parts[2]),
+                    "available_gb": to_gb(parts[3]),
+                    "percent": parts[4],
+                })
+    except Exception:
+        pass
+    return disks
+
+def get_load():
+    text = read_file("/proc/loadavg")
+    if not text:
+        return None
+    parts = text.split()
+    return {
+        "1min": float(parts[0]),
+        "5min": float(parts[1]),
+        "15min": float(parts[2]),
+    }
+
+def get_uptime():
+    text = read_file("/proc/uptime")
+    if not text:
+        return None
+    secs = float(text.split()[0])
+    days = int(secs // 86400)
+    hours = int((secs % 86400) // 3600)
+    mins = int((secs % 3600) // 60)
+    return {"seconds": round(secs), "human": f"{days}d {hours}h {mins}m"}
+
+def get_top_processes(by="cpu", n=5):
+    try:
+        result = subprocess.run(
+            ["ps", "axo", "pid,user,%cpu,%mem,rss,comm", "--sort=-%" + by],
+            capture_output=True, text=True, timeout=5
+        )
+        procs = []
+        for line in result.stdout.strip().split("\n")[1:n+1]:
+            parts = line.split(None, 5)
+            if len(parts) >= 6:
+                procs.append({
+                    "pid": int(parts[0]),
+                    "user": parts[1],
+                    "cpu_pct": float(parts[2]),
+                    "mem_pct": float(parts[3]),
+                    "rss_mb": round(int(parts[4]) / 1024, 1),
+                    "command": parts[5],
+                })
+        return procs
+    except Exception:
+        return []
+
+def get_cpu_count():
+    try:
+        return os.cpu_count() or 0
+    except Exception:
+        return 0
+
+def main():
+    pretty = "--pretty" in sys.argv or "-p" in sys.argv
+
+    if "-h" in sys.argv or "--help" in sys.argv:
+        print("Usage: syssnap [--pretty]")
+        print("Output a JSON snapshot of system health.")
+        print("\nFields: cpu_percent, cpu_count, memory, disk, load, uptime,")
+        print("        top_by_cpu, top_by_mem")
+        sys.exit(0)
+
+    snap = {
+        "cpu_percent": get_cpu_usage(),
+        "cpu_count": get_cpu_count(),
+        "memory": get_memory(),
+        "disk": get_disk(),
+        "load": get_load(),
+        "uptime": get_uptime(),
+        "top_by_cpu": get_top_processes("cpu", 5),
+        "top_by_mem": get_top_processes("mem", 5),
+    }
+
+    indent = 2 if pretty else None
+    print(json.dumps(snap, indent=indent))
+
+if __name__ == "__main__":
+    main()

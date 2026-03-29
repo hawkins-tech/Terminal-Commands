@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# waitport - Wait until a TCP port is accepting connections
+
+set -e
+
+usage() {
+  cat <<'EOF'
+Usage: waitport [options] HOST:PORT | PORT [-- command [args...]]
+
+Wait until a TCP port is accepting connections, then optionally run a command.
+If HOST is omitted, defaults to localhost.
+
+Options:
+  -t, --timeout SECS   Maximum seconds to wait (default: 30, 0 = forever)
+  -i, --interval SECS  Seconds between checks (default: 1)
+  -q, --quiet          Suppress progress output
+  -h, --help           Show this help
+
+Examples:
+  waitport 3000                              # Wait for localhost:3000
+  waitport 3000 -- npm test                  # Wait then run tests
+  waitport db:5432 -t 60                     # Wait up to 60s for db:5432
+  waitport 0.0.0.0:8080 -q -- curl localhost:8080/health
+
+Exit codes:
+  0  Port is accepting connections (or command exit code if -- command given)
+  1  Timeout reached
+EOF
+  exit 0
+}
+
+TIMEOUT=30
+INTERVAL=1
+QUIET=false
+HOST="localhost"
+PORT=""
+CMD=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -t|--timeout)  TIMEOUT="$2"; shift 2 ;;
+    -i|--interval) INTERVAL="$2"; shift 2 ;;
+    -q|--quiet)    QUIET=true; shift ;;
+    -h|--help)     usage ;;
+    --)            shift; CMD=("$@"); break ;;
+    -*)            echo "Unknown option: $1" >&2; exit 1 ;;
+    *)
+      if [[ -z "$PORT" ]]; then
+        if [[ "$1" == *:* ]]; then
+          HOST="${1%:*}"
+          PORT="${1##*:}"
+        else
+          PORT="$1"
+        fi
+      fi
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$PORT" ]]; then
+  echo "Error: PORT is required" >&2
+  echo "Usage: waitport [options] HOST:PORT | PORT [-- command]" >&2
+  exit 1
+fi
+
+elapsed=0
+while true; do
+  if (echo >/dev/tcp/"$HOST"/"$PORT") 2>/dev/null; then
+    [[ "$QUIET" == false ]] && echo "Port $HOST:$PORT is ready (${elapsed}s)" >&2
+    if [[ ${#CMD[@]} -gt 0 ]]; then
+      exec "${CMD[@]}"
+    fi
+    exit 0
+  fi
+
+  if [[ "$TIMEOUT" -gt 0 && "$elapsed" -ge "$TIMEOUT" ]]; then
+    [[ "$QUIET" == false ]] && echo "Timeout: port $HOST:$PORT not ready after ${TIMEOUT}s" >&2
+    exit 1
+  fi
+
+  [[ "$QUIET" == false ]] && echo "Waiting for $HOST:$PORT... (${elapsed}s)" >&2
+  sleep "$INTERVAL"
+  elapsed=$((elapsed + INTERVAL))
+done

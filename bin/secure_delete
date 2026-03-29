@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""
+fast-secure-delete — Threaded secure file deletion with DoD 5220.22-M.
+
+Phase 1: Overwrite each file (zeros -> ones -> random) for N cycles, then unlink.
+Phase 2: Zero free space on affected partitions.
+
+Signal handling:
+  1st SIGINT/SIGTERM -> stop overwriting, proceed to delete + wipe
+  2nd signal         -> skip free-space wipe
+  3rd signal         -> force exit
+"""
+
+import argparse
+import os
+import secrets
+import signal
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+BLOCK_SIZE = 1 << 20  # 1 MiB write chunks
+
+_stop_overwrite = threading.Event()
+_stop_wipe = threading.Event()
+_print_lock = threading.Lock()
+
+# Pre-allocated static buffers
+_ZEROS = b"\x00" * BLOCK_SIZE
+_ONES = b"\xff" * BLOCK_SIZE
+
+_DOD_PATTERN = ("zeros", "ones", "random")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _tprint(msg):
+    """Thread-safe print to stderr."""
+    with _print_lock:
+        print(msg, file=sys.stderr, flush=True)
+
+
+def _signal_handler(signum, _frame):
+    name = signal.Signals(signum).name
+    # Avoid acquiring _print_lock in signal handler (deadlock risk).
+    if not _stop_overwrite.is_set():
+        _stop_overwrite.set()
+        print(
+            f"\n[{name}] Stopping overwrite — proceeding to cleanup...",
+            file=sys.stderr,
+            flush=True,
+        )
+    elif not _stop_wipe.is_set():
+        _stop_wipe.set()
+        print(
+            f"\n[{name}] Skipping free-space wipe...",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        print(f"\n[{name}] Forced exit.", file=sys.stderr, flush=True)
+        os._exit(1)
+
+
+def _mount_of(path):
+    """Return the mount point that *path* lives on."""
+    path = os.path.realpath(path)
+    while not os.path.ismount(path):
+        path = os.path.dirname(path)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Core I/O
+# ---------------------------------------------------------------------------
+
+
+def _drop_caches():
+    """Ask the kernel to drop the page cache so overwrites hit disk.
+
+    Requires root — silently ignored otherwise.
+    """
+    try:
+        with open("/proc/sys/vm/drop_caches", "w") as f:
+            f.write("3\n")
+    except PermissionError:
+        pass
+
+
+def _overwrite_pass(fd, size, pattern):
+    """Write one full pass of *pattern* over *fd*."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    remaining = size
+    while remaining > 0:
+        n = min(BLOCK_SIZE, remaining)
+        if pattern == "zeros":
+            buf = _ZEROS if n == BLOCK_SIZE else _ZEROS[:n]
+        elif pattern == "ones":
+            buf = _ONES if n == BLOCK_SIZE else _ONES[:n]
+        else:
+            buf = os.urandom(n)
+        os.write(fd, buf)
+        remaining -= n
+    os.fsync(fd)
+    if pattern == "zeros":
+        _drop_caches()
+
+
+def secure_delete(filepath, passes, verbose):
+    """Overwrite *filepath* with DoD 5220.22-M, scrub its name, and unlink."""
+    real = os.path.realpath(filepath)
+    info = {"path": filepath, "ok": False, "error": None, "mount": None, "dir": None}
+
+    try:
+        if not os.path.isfile(real):
+            info["error"] = "not a regular file"
+            return info
+
+        size = os.path.getsize(real)
+        parent = os.path.dirname(real)
+        info["mount"] = _mount_of(real)
+        info["dir"] = parent
+
+        # Empty file — scrub name, then unlink
+        if size == 0:
+            scrubbed = os.path.join(parent, secrets.token_hex(16))
+            os.rename(real, scrubbed)
+            os.unlink(scrubbed)
+            info["ok"] = True
+            if verbose:
+                _tprint(f"  [deleted] {filepath} (empty)")
+            return info
+
+        # Ensure writable
+        st = os.stat(real)
+        if not st.st_mode & 0o200:
+            os.chmod(real, st.st_mode | 0o200)
+
+        # Scrub directory entry FIRST — rename before overwriting so the
+        # filesystem journal never associates the original name with the
+        # overwrite I/O, preventing filename recovery from the journal.
+        scrubbed = os.path.join(parent, secrets.token_hex(16))
+        os.rename(real, scrubbed)
+
+        # --- DoD 5220.22-M overwrite cycles ---
+        fd = os.open(scrubbed, os.O_WRONLY)
+        try:
+            cycle = 0
+            infinite = passes == 0
+            while infinite or cycle < passes:
+                if _stop_overwrite.is_set():
+                    break
+                for pat in _DOD_PATTERN:
+                    if _stop_overwrite.is_set():
+                        break
+                    _overwrite_pass(fd, size, pat)
+                cycle += 1
+                if verbose:
+                    tag = f"{cycle}/inf" if infinite else f"{cycle}/{passes}"
+                    _tprint(f"  [cycle {tag}] {filepath}")
+        finally:
+            os.close(fd)
+
+        # Truncate to release blocks, then unlink
+        fd = os.open(scrubbed, os.O_WRONLY)
+        try:
+            os.ftruncate(fd, 0)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.unlink(scrubbed)
+
+        info["ok"] = True
+        if verbose:
+            _tprint(f"  [deleted] {filepath}")
+
+    except Exception as e:
+        info["error"] = str(e)
+        _tprint(f"  [error] {filepath}: {e}")
+
+    return info
+
+
+def flush_journal(work_dir, verbose):
+    """Flood the filesystem journal with dummy transactions to overwrite old
+    directory entries (filenames).  Each create+sync+unlink generates journal
+    traffic that pushes out stale metadata.
+    """
+    # Typical ext4 journal is 16-128 MiB.  Each file create/unlink pair
+    # generates ~4-8 KiB of journal traffic, so 8192 iterations covers ~64 MiB
+    # which is enough to cycle through most journals.
+    count = 8192
+    if verbose:
+        _tprint(f"  [journal flush] {work_dir} ({count} dummy transactions)")
+    for i in range(count):
+        p = os.path.join(work_dir, f".fsd_jflush_{i:05d}")
+        try:
+            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.write(fd, b"\x00")
+            os.fsync(fd)
+            os.close(fd)
+            os.unlink(p)
+        except OSError:
+            break
+    # Final sync to commit remaining transactions
+    os.sync()
+    if verbose:
+        _tprint(f"  [journal flush] done")
+
+
+def zero_free_space(mount, work_dir, verbose):
+    """Fill free space on *mount* with zeros via a temp file in *work_dir*."""
+    if not os.path.isdir(work_dir):
+        work_dir = mount
+    if not os.access(work_dir, os.W_OK):
+        _tprint(f"  [skip] no write access for free-space wipe on {mount}")
+        return
+
+    path = os.path.join(work_dir, f".fsd_zero_{secrets.token_hex(8)}")
+    total = 0
+
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            while not _stop_wipe.is_set():
+                try:
+                    total += os.write(fd, _ZEROS)
+                except OSError:
+                    break  # disk full — done
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    if verbose:
+        _tprint(f"  [wiped] {mount} ({total >> 20} MiB zeroed)")
+
+
+# ---------------------------------------------------------------------------
+# File collection
+# ---------------------------------------------------------------------------
+
+
+def _collect(paths, recursive):
+    """Resolve CLI *paths* into (file_list, dirs_to_remove)."""
+    files, dirs = [], []
+    for p in paths:
+        real = os.path.realpath(p)
+        if os.path.isfile(real):
+            files.append(real)
+        elif os.path.isdir(real):
+            if not recursive:
+                _tprint(f"  [skip] {p}: directory (use -r to recurse)")
+                continue
+            for root, dnames, fnames in os.walk(real, topdown=False):
+                for f in fnames:
+                    files.append(os.path.join(root, f))
+                for d in dnames:
+                    dirs.append(os.path.join(root, d))
+            dirs.append(real)
+        else:
+            _tprint(f"  [skip] {p}: not found")
+    return files, dirs
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="fast-secure-delete",
+        description="Threaded secure file deletion with DoD 5220.22-M.",
+        epilog="Pass -p 0 for infinite overwrite until killed (SIGINT / SIGTERM).",
+    )
+    ap.add_argument(
+        "paths", nargs="+", metavar="PATH",
+        help="files or directories (-r) to securely delete",
+    )
+    ap.add_argument(
+        "-p", "--passes", type=int, default=1,
+        help="DoD overwrite cycles (default: 1, 0 = infinite until killed)",
+    )
+    ap.add_argument(
+        "-t", "--threads", type=int, default=None,
+        help=f"worker threads (default: {os.cpu_count()} = CPU count)",
+    )
+    ap.add_argument(
+        "-r", "--recursive", action="store_true",
+        help="recurse into directories",
+    )
+    ap.add_argument(
+        "--skip-free-space-wipe", action="store_true",
+        help="skip zeroing free space after deletion",
+    )
+    ap.add_argument("-v", "--verbose", action="store_true", help="per-file progress")
+    ap.add_argument("-q", "--quiet", action="store_true", help="suppress all output")
+    args = ap.parse_args()
+
+    verbose = args.verbose and not args.quiet
+    quiet = args.quiet
+    threads = args.threads or os.cpu_count() or 4
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    files, dirs = _collect(args.paths, args.recursive)
+    if not files:
+        if not quiet:
+            _tprint("No files to delete.")
+        return 0
+
+    if not quiet:
+        mode = "infinite (kill to stop)" if args.passes == 0 else f"{args.passes} cycle(s)"
+        _tprint(
+            f"[config] {len(files)} file(s) | {threads} thread(s) | "
+            f"{mode} | DoD 5220.22-M (3 passes/cycle)"
+        )
+
+    # ---- Phase 1: secure overwrite + delete --------------------------------
+    if not quiet:
+        _tprint("[phase 1] Secure overwrite and delete")
+
+    results = []
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        futs = {
+            pool.submit(secure_delete, f, args.passes, verbose): f for f in files
+        }
+        for fut in as_completed(futs):
+            results.append(fut.result())
+
+    # Clean up empty directories (deepest first from walk order)
+    for d in dirs:
+        try:
+            os.rmdir(d)
+            if verbose:
+                _tprint(f"  [rmdir] {d}")
+        except OSError:
+            pass
+
+    # ---- Phase 2: flush journal + zero free space ---------------------------
+    if not args.skip_free_space_wipe and not _stop_wipe.is_set():
+        mount_map = {}  # mount_point -> writable work_dir
+        for r in results:
+            if r["ok"] and r["mount"] and r["dir"]:
+                mount_map.setdefault(r["mount"], r["dir"])
+
+        if mount_map:
+            # Flush filesystem journals to overwrite old directory entries
+            if not quiet:
+                _tprint(
+                    f"[phase 2] Flushing journal + zeroing free space "
+                    f"({len(mount_map)} partition(s))"
+                )
+
+            with ThreadPoolExecutor(max_workers=max(1, len(mount_map))) as pool:
+                futs = [
+                    pool.submit(flush_journal, d, verbose)
+                    for d in mount_map.values()
+                ]
+                for fut in as_completed(futs):
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        _tprint(f"  [error] journal flush: {e}")
+
+            if not _stop_wipe.is_set():
+                with ThreadPoolExecutor(max_workers=max(1, len(mount_map))) as pool:
+                    futs = [
+                        pool.submit(zero_free_space, m, d, verbose)
+                        for m, d in mount_map.items()
+                    ]
+                    for fut in as_completed(futs):
+                        try:
+                            fut.result()
+                        except Exception as e:
+                            _tprint(f"  [error] free-space wipe: {e}")
+
+    # ---- Summary -----------------------------------------------------------
+    ok = sum(1 for r in results if r["ok"])
+    fail = sum(1 for r in results if not r["ok"])
+    if not quiet:
+        _tprint(f"[done] {ok} deleted, {fail} failed")
+    if fail and not quiet:
+        for r in results:
+            if not r["ok"]:
+                _tprint(f"  FAILED: {r['path']}: {r['error']}")
+
+    return 1 if fail else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

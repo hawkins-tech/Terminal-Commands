@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# portfree - Find an available TCP port
+
+set -e
+
+usage() {
+  cat <<'EOF'
+Usage: portfree [options] [START[-END]]
+
+Find an available TCP port. Prints the port number to stdout.
+Default range: 3000-9999.
+
+Options:
+  -h, --help    Show this help
+
+Examples:
+  portfree                # Find any free port in 3000-9999
+  portfree 8000-8100      # Find a free port in 8000-8100
+  portfree 3000           # Check if 3000 is free, or find next free
+
+Exit codes:
+  0  Found a free port (printed to stdout)
+  1  No free port found in range
+EOF
+  exit 0
+}
+
+START=3000
+END=9999
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage ;;
+    -*)        echo "Unknown option: $1" >&2; exit 1 ;;
+    *)
+      if [[ "$1" == *-* ]]; then
+        START="${1%-*}"
+        END="${1#*-}"
+      else
+        START="$1"
+        END="$1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+for port in $(seq "$START" "$END"); do
+  if ! (echo >/dev/tcp/localhost/"$port") 2>/dev/null; then
+    echo "$port"
+    exit 0
+  fi
+done
+
+echo "No free port found in range $START-$END" >&2
+exit 1

@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# portowner - Show what process owns a port, optionally kill it
+# Output is JSON for easy parsing by AI agents and scripts
+
+set -e
+
+usage() {
+  cat <<'EOF'
+Usage: portowner [options] PORT
+
+Show the process listening on a TCP port as JSON.
+
+Options:
+  -k, --kill         Kill the process owning the port
+  -s, --signal SIG   Signal to send with --kill (default: TERM)
+  -u, --udp          Check UDP instead of TCP
+  -h, --help         Show this help
+
+Examples:
+  portowner 3000
+  portowner --kill 8080
+  portowner -k -s KILL 5432
+
+Output (JSON):
+  {"port":3000,"proto":"tcp","pid":1234,"user":"mike","command":"node","cmdline":"node server.js","state":"LISTEN"}
+EOF
+  exit 0
+}
+
+KILL=false
+SIGNAL="TERM"
+PROTO="tcp"
+PORT=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -k|--kill)   KILL=true; shift ;;
+    -s|--signal) SIGNAL="$2"; shift 2 ;;
+    -u|--udp)    PROTO="udp"; shift ;;
+    -h|--help)   usage ;;
+    -*)          echo "Unknown option: $1" >&2; exit 1 ;;
+    *)           PORT="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$PORT" ]]; then
+  echo "Error: PORT is required" >&2
+  echo "Usage: portowner [options] PORT" >&2
+  exit 1
+fi
+
+if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [[ "$PORT" -lt 1 || "$PORT" -gt 65535 ]]; then
+  echo "Error: PORT must be a number between 1 and 65535" >&2
+  exit 1
+fi
+
+# Try ss first (more commonly available on modern systems), fall back to lsof
+get_port_info() {
+  local port="$1" proto="$2"
+
+  if command -v ss &>/dev/null; then
+    local flag
+    [[ "$proto" == "tcp" ]] && flag="-tln" || flag="-uln"
+    local line
+    line=$(ss "$flag" -p "sport = :$port" 2>/dev/null | tail -n +2 | head -1)
+    if [[ -n "$line" ]]; then
+      local pid
+      pid=$(echo "$line" | grep -oP 'pid=\K[0-9]+' | head -1)
+      if [[ -n "$pid" ]]; then
+        local user command cmdline state
+        user=$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')
+        command=$(ps -o comm= -p "$pid" 2>/dev/null | tr -d ' ')
+        cmdline=$(ps -o args= -p "$pid" 2>/dev/null | sed 's/^ *//')
+        state="LISTEN"
+        echo "$pid" "$user" "$command" "$cmdline" "$state"
+        return 0
+      fi
+    fi
+  fi
+
+  if command -v lsof &>/dev/null; then
+    local proto_filter
+    [[ "$proto" == "tcp" ]] && proto_filter="-iTCP:$port" || proto_filter="-iUDP:$port"
+    local line
+    line=$(lsof -nP "$proto_filter" -sTCP:LISTEN 2>/dev/null | tail -n +2 | head -1)
+    if [[ -n "$line" ]]; then
+      local pid user command
+      command=$(echo "$line" | awk '{print $1}')
+      pid=$(echo "$line" | awk '{print $2}')
+      user=$(echo "$line" | awk '{print $3}')
+      local cmdline
+      cmdline=$(ps -o args= -p "$pid" 2>/dev/null | sed 's/^ *//')
+      echo "$pid" "$user" "$command" "$cmdline" "LISTEN"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+info=$(get_port_info "$PORT" "$PROTO") || {
+  echo "{\"port\":$PORT,\"proto\":\"$PROTO\",\"error\":\"no process found on port $PORT\"}"
+  exit 1
+}
+
+read -r pid user command <<< "$(echo "$info" | awk '{print $1, $2, $3}')"
+cmdline=$(echo "$info" | cut -d' ' -f4- | sed 's/ [A-Z]*$//')
+state=$(echo "$info" | awk '{print $NF}')
+
+# Escape strings for JSON
+json_escape() { printf '%s' "$1" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()), end="")' 2>/dev/null || printf '"%s"' "$1"; }
+
+printf '{"port":%d,"proto":"%s","pid":%d,"user":%s,"command":%s,"cmdline":%s,"state":"%s"}\n' \
+  "$PORT" "$PROTO" "$pid" \
+  "$(json_escape "$user")" \
+  "$(json_escape "$command")" \
+  "$(json_escape "$cmdline")" \
+  "$state"
+
+if [[ "$KILL" == true ]]; then
+  if kill -"$SIGNAL" "$pid" 2>/dev/null; then
+    echo "{\"killed\":true,\"pid\":$pid,\"signal\":\"$SIGNAL\"}" >&2
+  else
+    echo "{\"killed\":false,\"pid\":$pid,\"signal\":\"$SIGNAL\",\"error\":\"kill failed\"}" >&2
+    exit 1
+  fi
+fi

@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""batchrename - Bulk rename files with regex, sequential numbering, or case conversion.
+Dry-run by default for safety."""
+
+import os
+import re
+import sys
+from pathlib import Path
+
+
+def usage():
+    print("""Usage: batchrename [options] PATTERN REPLACEMENT [PATH...]
+
+Bulk rename files using regex substitution. Dry-run by default.
+
+Arguments:
+  PATTERN       Regex pattern to match in filenames
+  REPLACEMENT   Replacement string (supports \\1, \\2 for capture groups)
+  PATH          Files/directories to process (default: current directory)
+
+Options:
+  -x, --execute       Actually rename files (default is dry-run)
+  -r, --recursive     Process directories recursively
+  -i, --ignore-case   Case-insensitive pattern matching
+  -d, --dirs          Rename directories too (default: files only)
+  --lower             Convert filenames to lowercase (ignores PATTERN/REPLACEMENT)
+  --upper             Convert filenames to uppercase (ignores PATTERN/REPLACEMENT)
+  --seq PREFIX N      Sequential rename: PREFIX001, PREFIX002, ... starting at N
+  --ext EXT           Only process files with this extension
+  -h, --help          Show this help
+
+Examples:
+  batchrename 'IMG_(\\d+)' 'photo_\\1' .          # Dry run: IMG_001.jpg → photo_001.jpg
+  batchrename -x 'IMG_(\\d+)' 'photo_\\1' .       # Actually rename
+  batchrename --lower '' '' ./documents            # Preview lowercase conversion
+  batchrename -x --lower '' '' ./documents         # Lowercase all filenames
+  batchrename --seq photo 1 ./images               # Preview photo001.jpg, photo002.jpg, ...
+  batchrename -x --ext .txt '\\.txt$' '.md' .      # Rename .txt to .md
+  batchrename -r 'foo' 'bar' ./src                 # Recursive dry run""")
+    sys.exit(0)
+
+
+def collect_files(paths, recursive=False, include_dirs=False, ext_filter=None):
+    """Collect files (and optionally dirs) from given paths."""
+    result = []
+    for p_str in paths:
+        p = Path(p_str)
+        if p.is_file():
+            if ext_filter and p.suffix != ext_filter:
+                continue
+            result.append(p)
+        elif p.is_dir():
+            if recursive:
+                for item in sorted(p.rglob("*")):
+                    if item.is_file() or (include_dirs and item.is_dir()):
+                        if ext_filter and item.is_file() and item.suffix != ext_filter:
+                            continue
+                        result.append(item)
+            else:
+                for item in sorted(p.iterdir()):
+                    if item.is_file() or (include_dirs and item.is_dir()):
+                        if ext_filter and item.is_file() and item.suffix != ext_filter:
+                            continue
+                        result.append(item)
+    return result
+
+
+def main():
+    args = sys.argv[1:]
+
+    if not args or "-h" in args or "--help" in args:
+        usage()
+
+    # Parse options
+    execute = False
+    recursive = False
+    ignore_case = False
+    include_dirs = False
+    to_lower = False
+    to_upper = False
+    seq_prefix = None
+    seq_start = 1
+    ext_filter = None
+
+    positional = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-x", "--execute"):
+            execute = True
+        elif a in ("-r", "--recursive"):
+            recursive = True
+        elif a in ("-i", "--ignore-case"):
+            ignore_case = True
+        elif a in ("-d", "--dirs"):
+            include_dirs = True
+        elif a == "--lower":
+            to_lower = True
+        elif a == "--upper":
+            to_upper = True
+        elif a == "--seq":
+            seq_prefix = args[i + 1]
+            seq_start = int(args[i + 2])
+            i += 2
+        elif a == "--ext":
+            ext_filter = args[i + 1]
+            if not ext_filter.startswith("."):
+                ext_filter = "." + ext_filter
+            i += 1
+        elif a.startswith("-"):
+            print(f"Unknown option: {a}", file=sys.stderr)
+            sys.exit(1)
+        else:
+            positional.append(a)
+        i += 1
+
+    # Determine mode
+    if to_lower or to_upper:
+        pattern = None
+        replacement = None
+        paths = positional if positional else ["."]
+    elif seq_prefix is not None:
+        pattern = None
+        replacement = None
+        paths = positional if positional else ["."]
+    else:
+        if len(positional) < 2:
+            print("Error: PATTERN and REPLACEMENT are required", file=sys.stderr)
+            sys.exit(1)
+        pattern = positional[0]
+        replacement = positional[1]
+        paths = positional[2:] if len(positional) > 2 else ["."]
+
+    files = collect_files(paths, recursive, include_dirs, ext_filter)
+
+    if not files:
+        print("No files found to rename", file=sys.stderr)
+        sys.exit(0)
+
+    renames = []
+    seq_counter = seq_start
+
+    flags = re.IGNORECASE if ignore_case else 0
+
+    for f in files:
+        old_name = f.name
+
+        if to_lower:
+            new_name = old_name.lower()
+        elif to_upper:
+            new_name = old_name.upper()
+        elif seq_prefix is not None:
+            ext = f.suffix
+            width = max(3, len(str(seq_start + len(files))))
+            new_name = f"{seq_prefix}{seq_counter:0{width}d}{ext}"
+            seq_counter += 1
+        else:
+            new_name = re.sub(pattern, replacement, old_name, flags=flags)
+
+        if new_name != old_name:
+            new_path = f.parent / new_name
+            renames.append((f, new_path))
+
+    if not renames:
+        print("No files would be renamed", file=sys.stderr)
+        sys.exit(0)
+
+    # Check for conflicts
+    destinations = {}
+    for old, new in renames:
+        if str(new) in destinations:
+            print(f"Conflict: both '{destinations[str(new)]}' and '{old}' would rename to '{new.name}'", file=sys.stderr)
+            sys.exit(1)
+        destinations[str(new)] = str(old)
+        if new.exists() and str(new) not in {str(o) for o, _ in renames}:
+            print(f"Conflict: '{new}' already exists", file=sys.stderr)
+            sys.exit(1)
+
+    # Display plan
+    label = "Renaming" if execute else "Would rename (dry run)"
+    print(f"\n{label} {len(renames)} file(s):\n", file=sys.stderr)
+
+    for old, new in renames:
+        old_rel = os.path.relpath(old)
+        new_name = new.name
+        print(f"  {old_rel}  →  {new_name}", file=sys.stderr)
+
+    if not execute:
+        print(f"\nDry run complete. Use -x/--execute to apply.", file=sys.stderr)
+        sys.exit(0)
+
+    # Execute renames
+    print(file=sys.stderr)
+    errors = 0
+    for old, new in renames:
+        try:
+            old.rename(new)
+        except Exception as e:
+            print(f"Error renaming '{old}': {e}", file=sys.stderr)
+            errors += 1
+
+    success = len(renames) - errors
+    print(f"Renamed {success} file(s)" + (f", {errors} error(s)" if errors else ""), file=sys.stderr)
+    sys.exit(1 if errors else 0)
+
+
+if __name__ == "__main__":
+    main()

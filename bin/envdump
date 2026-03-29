@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""envdump - JSON dump of the current environment: variables, PATH, tool versions, OS info."""
+
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+
+
+def get_version(cmd, args=None):
+    """Try to get version string from a command."""
+    if not shutil.which(cmd):
+        return None
+    try:
+        flag = args or ["--version"]
+        result = subprocess.run(
+            [cmd] + flag,
+            capture_output=True, text=True, timeout=5
+        )
+        output = (result.stdout or result.stderr).strip()
+        # Take first line, strip common prefixes
+        line = output.split("\n")[0]
+        return line
+    except Exception:
+        return None
+
+
+def main():
+    pretty = "--pretty" in sys.argv or "-p" in sys.argv
+
+    if "-h" in sys.argv or "--help" in sys.argv:
+        print("Usage: envdump [--pretty]")
+        print("Output a JSON dump of the current environment.")
+        print("\nFields: os, shell, path_entries, env, tools")
+        sys.exit(0)
+
+    # OS info
+    os_info = {
+        "system": platform.system(),
+        "release": platform.release(),
+        "version": platform.version(),
+        "machine": platform.machine(),
+        "hostname": platform.node(),
+        "distro": None,
+    }
+
+    # Try to get distro name on Linux
+    try:
+        import distro as distro_mod
+        os_info["distro"] = distro_mod.name(pretty=True)
+    except ImportError:
+        try:
+            with open("/etc/os-release") as f:
+                for line in f:
+                    if line.startswith("PRETTY_NAME="):
+                        os_info["distro"] = line.split("=", 1)[1].strip().strip('"')
+                        break
+        except (OSError, IOError):
+            pass
+
+    # Shell info
+    shell = os.environ.get("SHELL", "")
+    shell_name = os.path.basename(shell) if shell else "unknown"
+
+    # PATH entries
+    path_entries = [p for p in os.environ.get("PATH", "").split(":") if p]
+
+    # Environment variables (filter out long/binary values)
+    env_vars = {}
+    skip_keys = {"LS_COLORS", "LESSCLOSE", "LESSOPEN", "BASH_FUNC_%"}
+    for key, val in sorted(os.environ.items()):
+        if any(key.startswith(s.rstrip("%")) for s in skip_keys):
+            continue
+        if len(val) > 500:
+            env_vars[key] = val[:500] + "...(truncated)"
+        else:
+            env_vars[key] = val
+
+    # Common tool versions
+    tools_to_check = [
+        ("python3", ["--version"]),
+        ("python", ["--version"]),
+        ("node", ["--version"]),
+        ("npm", ["--version"]),
+        ("bun", ["--version"]),
+        ("deno", ["--version"]),
+        ("go", ["version"]),
+        ("rustc", ["--version"]),
+        ("cargo", ["--version"]),
+        ("java", ["-version"]),
+        ("gcc", ["--version"]),
+        ("g++", ["--version"]),
+        ("clang", ["--version"]),
+        ("make", ["--version"]),
+        ("cmake", ["--version"]),
+        ("git", ["--version"]),
+        ("docker", ["--version"]),
+        ("kubectl", ["version", "--client", "--short"]),
+        ("ruby", ["--version"]),
+        ("php", ["--version"]),
+        ("perl", ["--version"]),
+        ("curl", ["--version"]),
+        ("wget", ["--version"]),
+    ]
+
+    tools = {}
+    for cmd, args in tools_to_check:
+        ver = get_version(cmd, args)
+        if ver:
+            tools[cmd] = ver
+
+    # Package managers
+    pkg_managers = []
+    for pm in ["apt", "dnf", "yum", "pacman", "zypper", "brew", "snap", "flatpak", "nix"]:
+        if shutil.which(pm):
+            pkg_managers.append(pm)
+
+    dump = {
+        "os": os_info,
+        "shell": shell_name,
+        "shell_path": shell,
+        "path_entries": path_entries,
+        "package_managers": pkg_managers,
+        "tools": tools,
+        "env": env_vars,
+    }
+
+    indent = 2 if pretty else None
+    print(json.dumps(dump, indent=indent))
+
+
+if __name__ == "__main__":
+    main()

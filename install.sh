@@ -1,15 +1,15 @@
-#!/bin/bash
-# Installation script for bash-commands
-# Usage: curl -sSL https://raw.githubusercontent.com/hawkins-tech/bash-commands/main/install.sh | bash
+#!/usr/bin/env bash
+# Installation script for Terminal-Commands
+# Usage: curl -sSL https://raw.githubusercontent.com/hawkins-tech/Terminal-Commands/main/install.sh | bash
 
 set -e
 
-REPO_URL="https://github.com/hawkins-tech/bash-commands"
+REPO_URL="https://github.com/hawkins-tech/Terminal-Commands"
 INSTALL_DIR="/usr/local/bin"
 TEMP_DIR=$(mktemp -d)
 
 echo "==================================="
-echo "bash-commands installer"
+echo "Terminal-Commands installer"
 echo "==================================="
 echo ""
 
@@ -20,13 +20,13 @@ if [ "$EUID" -ne 0 ]; then
   echo ""
 fi
 
-echo "Downloading bash-commands..."
+echo "Downloading Terminal-Commands..."
 cd "$TEMP_DIR"
 
 # Try to download using git if available, otherwise use curl/wget
 if command -v git &> /dev/null; then
-  git clone --depth 1 "$REPO_URL" bash-commands
-  cd bash-commands
+  git clone --depth 1 "$REPO_URL" Terminal-Commands
+  cd Terminal-Commands
 else
   echo "Error: git is required for installation"
   echo "Please install git and try again"
@@ -36,15 +36,10 @@ fi
 echo ""
 echo "Installing commands to $INSTALL_DIR..."
 
-# Install each command from bin/
-for cmd in bin/*; do
-  if [ -f "$cmd" ]; then
-    CMD_NAME=$(basename "$cmd")
-    echo "  Installing $CMD_NAME..."
-    sudo cp "$cmd" "$INSTALL_DIR/$CMD_NAME"
-    sudo chmod +x "$INSTALL_DIR/$CMD_NAME"
-  fi
-done
+# Make scripts executable and install
+chmod +x bin/*
+sudo cp bin/* "$INSTALL_DIR/"
+echo "  Installed $(ls bin/ | wc -w) commands"
 
 echo ""
 echo "Cleaning up..."
@@ -56,8 +51,29 @@ echo "Installation complete!"
 echo "==================================="
 echo ""
 echo "The following commands are now available:"
-echo "  - killgrep <name>    : Kill processes matching a name pattern"
-echo "  - always <command>   : Keep retrying a command until it succeeds"
-echo "  - execs              : List all executable files in PATH"
 echo ""
-echo "Try running 'execs' to see all available executables!"
+echo "  Process & Port Management:"
+echo "  - killgrep <pattern>   Kill processes matching a name pattern"
+echo "  - portowner <port>     Show/kill what owns a port (JSON)"
+echo "  - waitport <port>      Wait until a port is ready"
+echo "  - waitpid <pid>        Wait for any process to exit"
+echo "  - portfree [range]     Find an available port"
+echo ""
+echo "  System Introspection:"
+echo "  - syssnap              System health snapshot (JSON)"
+echo "  - gitstat              Git repo state (JSON)"
+echo "  - envdump              Environment dump (JSON)"
+echo "  - diskwhy [path]       Disk usage breakdown"
+echo ""
+echo "  File Operations:"
+echo "  - trash <path>         Move files to recoverable trash"
+echo "  - secure_delete <path> Securely wipe files (DoD standard)"
+echo "  - checkpoint <cmd>     Named file/directory snapshots"
+echo "  - batchrename <p> <r>  Bulk rename with regex (dry-run default)"
+echo ""
+echo "  Streaming & Looping:"
+echo "  - firstmatch <pattern> Print first matching line from stdin"
+echo "  - always <command>     Retry a command forever"
+echo "  - execs                List all executables in PATH"
+echo ""
+echo "Run any command with -h or --help for usage details."
